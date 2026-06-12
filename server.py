@@ -3,7 +3,7 @@ import requests
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("stock-prices")
+mcp = FastMCP("stock-prices", host="0.0.0.0")
 
 FUGLE_API_KEY = os.environ.get("FUGLE_API_KEY", "")
 
