@@ -79,8 +79,22 @@ def get_multiple_stock_prices(symbols: list[str]) -> dict:
     return {s: get_stock_price(s) for s in symbols}
 
 
+class _AllowAllHosts:
+    """Rewrite Host header to 'localhost' so MCP's TrustedHostMiddleware passes."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            scope["headers"] = [
+                (b"host", b"localhost") if k == b"host" else (k, v)
+                for k, v in scope.get("headers", [])
+            ]
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    app = mcp.sse_app()
+    app = _AllowAllHosts(mcp.sse_app())
     uvicorn.run(app, host="0.0.0.0", port=port)
