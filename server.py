@@ -8,12 +8,6 @@ import requests
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
 
-try:
-    import pandas_ta as ta
-    HAS_PANDAS_TA = True
-except ImportError:
-    HAS_PANDAS_TA = False
-
 mcp = FastMCP("stock-prices", host="0.0.0.0")
 
 FUGLE_API_KEY = os.environ.get("FUGLE_API_KEY", "")
@@ -249,9 +243,6 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
     - volume：最新成交量
     - chart_url：（美股限定）Finviz 技術分析日線圖連結
     """
-    if not HAS_PANDAS_TA:
-        return {"error": "pandas-ta 未安裝，請執行：pip install pandas-ta"}
-
     yf_symbol, _, market = _resolve(symbol)
 
     try:
@@ -260,28 +251,47 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
             return {"error": f"無法取得 {symbol} 歷史資料"}
 
         close = df["Close"]
-        rsi_s = ta.rsi(close, length=14)
-        macd_df = ta.macd(close, fast=12, slow=26, signal=9)
-        bb_df = ta.bbands(close, length=20, std=2)
-        sma5 = ta.sma(close, length=5)
-        sma20 = ta.sma(close, length=20)
-        sma60 = ta.sma(close, length=60)
+
+        # SMA
+        ma5  = close.rolling(5).mean().iloc[-1]
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma60 = close.rolling(60).mean().iloc[-1]
+
+        # RSI(14)
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss
+        rsi = (100 - 100 / (1 + rs)).iloc[-1]
+
+        # MACD(12,26,9)
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line   = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist   = macd_line - signal_line
+
+        # Bollinger Bands(20, 2σ)
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        bb_upper = sma20 + 2 * std20
+        bb_lower = sma20 - 2 * std20
 
         result = {
             "symbol": yf_symbol,
             "period": period,
             "last_close": _safe_float(close.iloc[-1]),
             "volume": int(df["Volume"].iloc[-1]) if not pd.isna(df["Volume"].iloc[-1]) else None,
-            "rsi_14": _safe_float(rsi_s.iloc[-1]) if rsi_s is not None else None,
-            "macd":        _safe_float(macd_df["MACD_12_26_9"].iloc[-1])  if macd_df is not None else None,
-            "macd_signal": _safe_float(macd_df["MACDs_12_26_9"].iloc[-1]) if macd_df is not None else None,
-            "macd_hist":   _safe_float(macd_df["MACDh_12_26_9"].iloc[-1]) if macd_df is not None else None,
-            "ma_5":  _safe_float(sma5.iloc[-1])  if sma5  is not None else None,
-            "ma_20": _safe_float(sma20.iloc[-1]) if sma20 is not None else None,
-            "ma_60": _safe_float(sma60.iloc[-1]) if sma60 is not None else None,
-            "bb_upper": _safe_float(bb_df["BBU_20_2.0"].iloc[-1]) if bb_df is not None else None,
-            "bb_mid":   _safe_float(bb_df["BBM_20_2.0"].iloc[-1]) if bb_df is not None else None,
-            "bb_lower": _safe_float(bb_df["BBL_20_2.0"].iloc[-1]) if bb_df is not None else None,
+            "rsi_14":      _safe_float(rsi),
+            "macd":        _safe_float(macd_line.iloc[-1]),
+            "macd_signal": _safe_float(signal_line.iloc[-1]),
+            "macd_hist":   _safe_float(macd_hist.iloc[-1]),
+            "ma_5":        _safe_float(ma5),
+            "ma_20":       _safe_float(ma20),
+            "ma_60":       _safe_float(ma60),
+            "bb_upper":    _safe_float(bb_upper.iloc[-1]),
+            "bb_mid":      _safe_float(sma20.iloc[-1]),
+            "bb_lower":    _safe_float(bb_lower.iloc[-1]),
         }
 
         if market == "US" and not yf_symbol.startswith("^"):
