@@ -2,3 +2,5 @@ mcp[cli]
 yfinance
 requests
 uvicorn
+pandas-ta
+pytz
