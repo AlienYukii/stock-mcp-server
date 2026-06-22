@@ -303,6 +303,338 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
         return {"error": str(e)}
 
 
+@mcp.tool()
+def get_fundamentals(symbol: str) -> dict:
+    """
+    取得股票基本面資料。支援美股、台股、韓股，中文別名同 get_stock_price。
+
+    回傳：
+    - pe_trailing / pe_forward：本益比（歷史 / 預估）
+    - eps_ttm：每股盈餘（近四季）
+    - market_cap：市值
+    - revenue_ttm：年度營收
+    - gross_margin / operating_margin：毛利率 / 營業利益率
+    - roe / roa：股東權益報酬率 / 資產報酬率
+    - debt_to_equity：負債權益比
+    - current_ratio：流動比率
+    - 52w_high / 52w_low：52 週高低點
+    """
+    yf_symbol, _, _ = _resolve(symbol)
+    try:
+        info = yf.Ticker(yf_symbol).info
+        return {
+            "symbol":           yf_symbol,
+            "pe_trailing":      _safe_float(info.get("trailingPE")),
+            "pe_forward":       _safe_float(info.get("forwardPE")),
+            "eps_ttm":          _safe_float(info.get("epsTrailingTwelveMonths")),
+            "market_cap":       info.get("marketCap"),
+            "revenue_ttm":      info.get("totalRevenue"),
+            "gross_margin":     _safe_float(info.get("grossMargins")),
+            "operating_margin": _safe_float(info.get("operatingMargins")),
+            "roe":              _safe_float(info.get("returnOnEquity")),
+            "roa":              _safe_float(info.get("returnOnAssets")),
+            "debt_to_equity":   _safe_float(info.get("debtToEquity")),
+            "current_ratio":    _safe_float(info.get("currentRatio")),
+            "52w_high":         _safe_float(info.get("fiftyTwoWeekHigh")),
+            "52w_low":          _safe_float(info.get("fiftyTwoWeekLow")),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_dividend_info(symbol: str) -> dict:
+    """
+    取得股息與配息資訊。支援美股、台股、韓股，中文別名同 get_stock_price。
+
+    回傳：
+    - dividend_yield：殖利率（小數，如 0.015 = 1.5%）
+    - annual_dividend：年度配息金額（每股）
+    - payout_ratio：配息率
+    - ex_dividend_date：除息日
+    - last_dividends：近 8 筆配息紀錄（日期 + 金額）
+    """
+    yf_symbol, _, _ = _resolve(symbol)
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        info = ticker.info
+        dividends = ticker.dividends
+
+        last_divs = []
+        if not dividends.empty:
+            for dt, val in dividends.tail(8).items():
+                last_divs.append({"date": dt.strftime("%Y-%m-%d"), "amount": round(float(val), 4)})
+
+        ex_date = info.get("exDividendDate")
+        if isinstance(ex_date, (int, float)) and ex_date:
+            try:
+                ex_date = datetime.utcfromtimestamp(ex_date).strftime("%Y-%m-%d")
+            except Exception:
+                ex_date = str(ex_date)
+
+        return {
+            "symbol":           yf_symbol,
+            "dividend_yield":   _safe_float(info.get("dividendYield")),
+            "annual_dividend":  _safe_float(info.get("dividendRate")),
+            "payout_ratio":     _safe_float(info.get("payoutRatio")),
+            "ex_dividend_date": ex_date,
+            "last_dividends":   last_divs,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_stock_news(symbol: str, limit: int = 8) -> dict:
+    """
+    取得股票最新新聞標題。支援美股、台股、韓股，中文別名同 get_stock_price。
+
+    參數：
+    - symbol：股票代號或中文別名
+    - limit：回傳新聞數量（預設 8，最多 20）
+
+    回傳：
+    - news：新聞列表，每筆含 title、publisher、link、published
+    """
+    yf_symbol, _, _ = _resolve(symbol)
+    limit = min(int(limit), 20)
+    try:
+        news_raw = yf.Ticker(yf_symbol).news or []
+        items = []
+        for n in news_raw[:limit]:
+            # yfinance >=0.2.37 wraps content under a "content" key
+            c = n.get("content", n)
+            pub_time = c.get("pubDate") or c.get("providerPublishTime")
+            if isinstance(pub_time, (int, float)):
+                pub_time = datetime.utcfromtimestamp(pub_time).strftime("%Y-%m-%d %H:%M")
+            canonical = c.get("canonicalUrl")
+            link = (canonical.get("url") if isinstance(canonical, dict) else canonical) or c.get("link") or n.get("link")
+            provider = c.get("provider")
+            publisher = (provider.get("displayName") if isinstance(provider, dict) else provider) or c.get("publisher") or n.get("publisher")
+            items.append({
+                "title":     c.get("title") or n.get("title"),
+                "publisher": publisher,
+                "link":      link,
+                "published": pub_time,
+            })
+        return {"symbol": yf_symbol, "count": len(items), "news": items}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_analyst_ratings(symbol: str) -> dict:
+    """
+    取得分析師評級與目標價。主要適用美股。
+
+    回傳：
+    - recommendation：綜合評級（如 buy / hold / sell）
+    - target_price / target_high / target_low：目標價（平均 / 最高 / 最低）
+    - num_analysts：覆蓋分析師人數
+    - ratings_breakdown：最新一期 Strong Buy / Buy / Hold / Sell / Strong Sell 人數分佈
+    """
+    yf_symbol, _, _ = _resolve(symbol)
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        info = ticker.info
+        result = {
+            "symbol":         yf_symbol,
+            "recommendation": info.get("recommendationKey"),
+            "target_price":   _safe_float(info.get("targetMeanPrice")),
+            "target_high":    _safe_float(info.get("targetHighPrice")),
+            "target_low":     _safe_float(info.get("targetLowPrice")),
+            "num_analysts":   info.get("numberOfAnalystOpinions"),
+        }
+        rec = ticker.recommendations
+        if rec is not None and not rec.empty:
+            latest = rec.iloc[-1]
+            result["ratings_breakdown"] = {
+                "strong_buy":  int(latest.get("strongBuy",  0)),
+                "buy":         int(latest.get("buy",         0)),
+                "hold":        int(latest.get("hold",        0)),
+                "sell":        int(latest.get("sell",        0)),
+                "strong_sell": int(latest.get("strongSell", 0)),
+            }
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_market_overview() -> dict:
+    """
+    一次取得全球主要市場大盤快照，不需要傳入任何參數。
+
+    回傳指數：
+    - 台灣加權（^TWII）
+    - S&P 500（^GSPC）
+    - NASDAQ（^IXIC）
+    - 道瓊（^DJI）
+    - 費城半導體（^SOX）
+    - VIX 恐慌指數（^VIX）
+
+    每個指數回傳：price、change_pct、currency
+    """
+    _INDICES = {
+        "台灣加權 TWII": "^TWII",
+        "S&P 500":       "^GSPC",
+        "NASDAQ":        "^IXIC",
+        "道瓊 DJI":      "^DJI",
+        "費半 SOX":      "^SOX",
+        "VIX":           "^VIX",
+    }
+    result = {}
+    for name, sym in _INDICES.items():
+        data = _fetch_yf(sym)
+        if data:
+            result[name] = {
+                "symbol":     sym,
+                "price":      data["price"],
+                "change_pct": data.get("change_pct"),
+                "currency":   data.get("currency", "USD"),
+            }
+        else:
+            result[name] = {"symbol": sym, "error": "無法取得"}
+    return result
+
+
+@mcp.tool()
+def get_earnings_calendar(symbol: str) -> dict:
+    """
+    查詢股票下一次財報發布日及相關預估值。主要適用美股。
+    中文別名同 get_stock_price（如「蘋果」、「輝達」）。
+
+    回傳：
+    - earnings_date：財報發布日（可能含區間）
+    - eps_estimate：EPS 預估值
+    - revenue_estimate：營收預估值
+    - last_earnings_date / last_eps_actual：上一季財報日與實際 EPS
+    """
+    yf_symbol, _, _ = _resolve(symbol)
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        cal = ticker.calendar
+
+        def _fmt_date(val):
+            if val is None:
+                return None
+            if hasattr(val, "strftime"):
+                return val.strftime("%Y-%m-%d")
+            return str(val)
+
+        if cal is None or (hasattr(cal, "empty") and cal.empty):
+            return {"symbol": yf_symbol, "error": "無財報行事曆資料"}
+
+        # yfinance returns a dict
+        if isinstance(cal, dict):
+            earnings_dates = cal.get("Earnings Date", [])
+            if hasattr(earnings_dates, "tolist"):
+                earnings_dates = earnings_dates.tolist()
+            dates = [_fmt_date(d) for d in (earnings_dates if isinstance(earnings_dates, list) else [earnings_dates])]
+            return {
+                "symbol":           yf_symbol,
+                "earnings_date":    dates,
+                "eps_estimate":     _safe_float(cal.get("EPS Estimate")),
+                "revenue_estimate": cal.get("Revenue Estimate"),
+            }
+
+        # fallback: DataFrame
+        return {"symbol": yf_symbol, "calendar_raw": str(cal)}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def compare_stocks(symbols: list[str], period: str = "1y") -> dict:
+    """
+    比較多檔股票在相同期間的報酬率，並由高到低排名。
+    台股、美股、韓股可混合，中文別名同 get_stock_price。
+
+    參數：
+    - symbols：股票代號或中文別名清單，如 ['AAPL', 'NVDA', '2330', 'TSLA']
+    - period：比較區間，預設 1y（可選：1mo / 3mo / 6mo / 1y / 2y / 5y）
+
+    回傳：
+    - ranked：依報酬率排序的清單，每筆含 symbol、start_price、end_price、return_pct
+    - period：使用的區間
+    """
+    results = []
+    for raw in symbols:
+        yf_symbol, _, _ = _resolve(raw)
+        try:
+            hist = yf.Ticker(yf_symbol).history(period=period)
+            if hist.empty or len(hist) < 2:
+                results.append({"symbol": yf_symbol, "input": raw, "error": "資料不足"})
+                continue
+            start = float(hist["Close"].iloc[0])
+            end   = float(hist["Close"].iloc[-1])
+            ret   = round((end - start) / start * 100, 2)
+            results.append({
+                "symbol":      yf_symbol,
+                "input":       raw,
+                "start_price": round(start, 4),
+                "end_price":   round(end, 4),
+                "return_pct":  ret,
+            })
+        except Exception as e:
+            results.append({"symbol": yf_symbol, "input": raw, "error": str(e)})
+
+    ranked = sorted(
+        [r for r in results if "return_pct" in r],
+        key=lambda x: x["return_pct"],
+        reverse=True,
+    )
+    errors = [r for r in results if "error" in r]
+    return {"period": period, "ranked": ranked, "errors": errors}
+
+
+@mcp.tool()
+def get_institutional_holders(symbol: str) -> dict:
+    """
+    取得機構法人持股資訊。主要適用美股。
+    中文別名同 get_stock_price（如「蘋果」、「輝達」）。
+
+    回傳：
+    - top_holders：前 10 大機構持股人（機構名、持股數、佔比、市值）
+    - major_holders：大股東結構摘要（如散戶比例、機構持股比例）
+    """
+    yf_symbol, _, _ = _resolve(symbol)
+    try:
+        ticker = yf.Ticker(yf_symbol)
+
+        inst = ticker.institutional_holders
+        major = ticker.major_holders
+
+        top = []
+        if inst is not None and not inst.empty:
+            for _, row in inst.head(10).iterrows():
+                entry = {}
+                for col in inst.columns:
+                    val = row[col]
+                    if hasattr(val, "strftime"):
+                        val = val.strftime("%Y-%m-%d")
+                    elif hasattr(val, "item"):
+                        val = val.item()
+                    entry[col] = val
+                top.append(entry)
+
+        major_dict = {}
+        if major is not None and not major.empty:
+            for _, row in major.iterrows():
+                key = str(row.iloc[1]) if len(row) > 1 else str(_)
+                val = str(row.iloc[0])
+                major_dict[key] = val
+
+        return {
+            "symbol":        yf_symbol,
+            "top_holders":   top,
+            "major_holders": major_dict,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
     from starlette.applications import Starlette
