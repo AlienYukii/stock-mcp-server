@@ -1,4 +1,5 @@
 import os
+import xml.etree.ElementTree as ET
 from datetime import time as dtime
 from datetime import datetime
 
@@ -6,6 +7,7 @@ import pandas as pd
 import pytz
 import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("stock-prices", host="0.0.0.0")
@@ -34,6 +36,18 @@ _STOCK_TOKEN_MAP: dict[str, str] = {
 _KR_ALIAS_MAP: dict[str, str] = {
     "SMSN": "005930.KS",  # Samsung Electronics
     "SKH":  "000660.KS",  # SK Hynix
+}
+
+# ── KR ticker code → Korean company name (for Google News queries) ───────────
+_KR_NAME_MAP: dict[str, str] = {
+    "005930": "삼성전자",
+    "000660": "SK하이닉스",
+    "005380": "현대자동차",
+    "000270": "기아",
+    "035420": "네이버",
+    "035720": "카카오",
+    "051910": "LG화학",
+    "005490": "포스코홀딩스",
 }
 
 # ── All display aliases → canonical ticker ────────────────────────────────────
@@ -161,6 +175,84 @@ def _fetch_yf(symbol: str) -> dict | None:
             prev = float(hist["Close"].iloc[-2])
         change_pct = round((price - float(prev)) / float(prev) * 100, 2) if prev else None
         return {"symbol": symbol, "price": price, "change_pct": change_pct, "currency": currency, "source": "yfinance"}
+    except Exception:
+        return None
+
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _fetch_finviz_news(symbol: str, limit: int) -> list[dict] | None:
+    """Scrape the news table from a Finviz quote page. US stocks only."""
+    url = f"https://finviz.com/quote.ashx?t={symbol}&p=d"
+    try:
+        resp = requests.get(url, headers={"User-Agent": _BROWSER_UA}, timeout=10)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table", class_="fullview-news-outer")
+        if table is None:
+            return None
+        items = []
+        last_date = None
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            a = row.find("a")
+            if len(cells) < 2 or a is None:
+                continue
+            # First cell: "Jul-02-26 08:30AM" on the first item of a day,
+            # then time-only ("07:15AM") for the rest of that day.
+            ts = cells[0].get_text(strip=True)
+            if " " in ts:
+                last_date, ts_time = ts.rsplit(" ", 1)
+            else:
+                ts_time = ts
+            span = row.find("span")
+            publisher = span.get_text(strip=True).strip("()") if span else None
+            items.append({
+                "title":     a.get_text(strip=True),
+                "publisher": publisher,
+                "link":      a.get("href"),
+                "published": f"{last_date} {ts_time}" if last_date else ts_time,
+            })
+            if len(items) >= limit:
+                break
+        return items or None
+    except Exception:
+        return None
+
+
+def _fetch_google_news(query: str, hl: str, gl: str, ceid: str, limit: int) -> list[dict] | None:
+    """Fetch news items from Google News RSS search."""
+    try:
+        resp = requests.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": hl, "gl": gl, "ceid": ceid},
+            headers={"User-Agent": _BROWSER_UA},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        root = ET.fromstring(resp.content)
+        items = []
+        for item in root.iter("item"):
+            pub = item.findtext("pubDate")
+            try:
+                pub = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z").strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+            items.append({
+                "title":     item.findtext("title"),
+                "publisher": item.findtext("source"),
+                "link":      item.findtext("link"),
+                "published": pub,
+            })
+            if len(items) >= limit:
+                break
+        return items or None
     except Exception:
         return None
 
@@ -389,15 +481,43 @@ def get_stock_news(symbol: str, limit: int = 8) -> dict:
     """
     取得股票最新新聞標題。支援美股、台股、韓股，中文別名同 get_stock_price。
 
+    新聞來源依市場自動選擇：
+    - 美股：Finviz（即時聚合，品質最佳），失敗時 fallback yfinance
+    - 韓股：Google News 韓文搜尋（三星/SK海力士等大型股用韓文公司名查詢）
+    - 台股：Google News 繁中搜尋
+    - 指數或其他：yfinance
+
     參數：
     - symbol：股票代號或中文別名
     - limit：回傳新聞數量（預設 8，最多 20）
 
     回傳：
+    - source：實際使用的新聞來源
     - news：新聞列表，每筆含 title、publisher、link、published
+      （韓股新聞標題為韓文、台股為中文，可自行翻譯摘要給使用者）
     """
-    yf_symbol, _, _ = _resolve(symbol)
+    yf_symbol, _, market = _resolve(symbol)
     limit = min(int(limit), 20)
+
+    if market == "US":
+        items = _fetch_finviz_news(yf_symbol, limit)
+        if items:
+            return {"symbol": yf_symbol, "source": "Finviz", "count": len(items), "news": items}
+
+    elif market == "KR":
+        code = yf_symbol.split(".")[0]
+        query = _KR_NAME_MAP.get(code, f"{code} 주식")
+        items = _fetch_google_news(query, hl="ko", gl="KR", ceid="KR:ko", limit=limit)
+        if items:
+            return {"symbol": yf_symbol, "source": f"Google News ({query})", "count": len(items), "news": items}
+
+    elif market == "TW":
+        code = yf_symbol.split(".")[0]
+        items = _fetch_google_news(f"{code} 股價", hl="zh-TW", gl="TW", ceid="TW:zh-Hant", limit=limit)
+        if items:
+            return {"symbol": yf_symbol, "source": "Google News", "count": len(items), "news": items}
+
+    # Fallback: yfinance
     try:
         news_raw = yf.Ticker(yf_symbol).news or []
         items = []
@@ -417,7 +537,7 @@ def get_stock_news(symbol: str, limit: int = 8) -> dict:
                 "link":      link,
                 "published": pub_time,
             })
-        return {"symbol": yf_symbol, "count": len(items), "news": items}
+        return {"symbol": yf_symbol, "source": "yfinance", "count": len(items), "news": items}
     except Exception as e:
         return {"error": str(e)}
 
