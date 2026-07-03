@@ -1,4 +1,5 @@
 import os
+import time
 import xml.etree.ElementTree as ET
 from datetime import time as dtime
 from datetime import datetime
@@ -83,6 +84,46 @@ _ALIASES: dict[str, str] = {
 }
 
 
+# ── TTL cache: Yahoo rate-limits Render's shared egress IPs aggressively, so
+# every yfinance result is cached; only successful fetches are stored ─────────
+_CACHE: dict[tuple, tuple[float, object]] = {}
+
+TTL_PRICE   = 60      # real-time quotes
+TTL_NEWS    = 600     # news lists
+TTL_HISTORY = 600     # OHLCV history (TA / compare)
+TTL_INFO    = 900     # ticker.info (fundamentals / ratings)
+TTL_SLOW    = 3600    # dividends / recommendations / calendar / holders
+
+
+def _memo(key: tuple, ttl: int, fn):
+    """Return cached value for key if fresh; otherwise call fn and cache a
+    non-None result. fn must return None on failure so errors are retried."""
+    hit = _CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    if val is not None:
+        if len(_CACHE) > 500:
+            _CACHE.clear()
+        _CACHE[key] = (now, val)
+    return val
+
+
+def _yf_info(symbol: str) -> dict:
+    def fetch():
+        info = yf.Ticker(symbol).info
+        return info if info else None
+    return _memo(("info", symbol), TTL_INFO, fetch) or {}
+
+
+def _yf_history(symbol: str, period: str):
+    def fetch():
+        df = yf.Ticker(symbol).history(period=period)
+        return df if not df.empty else None
+    return _memo(("hist", symbol, period), TTL_HISTORY, fetch)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _is_market_open(market: str) -> bool:
@@ -155,6 +196,10 @@ def _fetch_fugle(symbol: str) -> dict | None:
 
 
 def _fetch_yf(symbol: str) -> dict | None:
+    return _memo(("price", symbol), TTL_PRICE, lambda: _fetch_yf_uncached(symbol))
+
+
+def _fetch_yf_uncached(symbol: str) -> dict | None:
     try:
         ticker = yf.Ticker(symbol)
         is_index = symbol.startswith("^")
@@ -186,6 +231,10 @@ _BROWSER_UA = (
 
 
 def _fetch_finviz_news(symbol: str, limit: int) -> list[dict] | None:
+    return _memo(("finviz", symbol, limit), TTL_NEWS, lambda: _fetch_finviz_news_uncached(symbol, limit))
+
+
+def _fetch_finviz_news_uncached(symbol: str, limit: int) -> list[dict] | None:
     """Scrape the news table from a Finviz quote page. US stocks only."""
     url = f"https://finviz.com/quote.ashx?t={symbol}&p=d"
     try:
@@ -226,6 +275,11 @@ def _fetch_finviz_news(symbol: str, limit: int) -> list[dict] | None:
 
 
 def _fetch_google_news(query: str, hl: str, gl: str, ceid: str, limit: int) -> list[dict] | None:
+    return _memo(("gnews", query, hl, limit), TTL_NEWS,
+                 lambda: _fetch_google_news_uncached(query, hl, gl, ceid, limit))
+
+
+def _fetch_google_news_uncached(query: str, hl: str, gl: str, ceid: str, limit: int) -> list[dict] | None:
     """Fetch news items from Google News RSS search."""
     try:
         resp = requests.get(
@@ -338,8 +392,8 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
     yf_symbol, _, market = _resolve(symbol)
 
     try:
-        df = yf.Ticker(yf_symbol).history(period=period)
-        if df.empty:
+        df = _yf_history(yf_symbol, period)
+        if df is None:
             return {"error": f"無法取得 {symbol} 歷史資料"}
 
         close = df["Close"]
@@ -413,7 +467,7 @@ def get_fundamentals(symbol: str) -> dict:
     """
     yf_symbol, _, _ = _resolve(symbol)
     try:
-        info = yf.Ticker(yf_symbol).info
+        info = _yf_info(yf_symbol)
         return {
             "symbol":           yf_symbol,
             "pe_trailing":      _safe_float(info.get("trailingPE")),
@@ -448,12 +502,15 @@ def get_dividend_info(symbol: str) -> dict:
     """
     yf_symbol, _, _ = _resolve(symbol)
     try:
-        ticker = yf.Ticker(yf_symbol)
-        info = ticker.info
-        dividends = ticker.dividends
+        info = _yf_info(yf_symbol)
+
+        def _fetch_divs():
+            d = yf.Ticker(yf_symbol).dividends
+            return d if not d.empty else None
+        dividends = _memo(("divs", yf_symbol), TTL_SLOW, _fetch_divs)
 
         last_divs = []
-        if not dividends.empty:
+        if dividends is not None:
             for dt, val in dividends.tail(8).items():
                 last_divs.append({"date": dt.strftime("%Y-%m-%d"), "amount": round(float(val), 4)})
 
@@ -519,7 +576,7 @@ def get_stock_news(symbol: str, limit: int = 8) -> dict:
 
     # Fallback: yfinance
     try:
-        news_raw = yf.Ticker(yf_symbol).news or []
+        news_raw = _memo(("yfnews", yf_symbol), TTL_NEWS, lambda: yf.Ticker(yf_symbol).news or None) or []
         items = []
         for n in news_raw[:limit]:
             # yfinance >=0.2.37 wraps content under a "content" key
@@ -555,8 +612,7 @@ def get_analyst_ratings(symbol: str) -> dict:
     """
     yf_symbol, _, _ = _resolve(symbol)
     try:
-        ticker = yf.Ticker(yf_symbol)
-        info = ticker.info
+        info = _yf_info(yf_symbol)
         result = {
             "symbol":         yf_symbol,
             "recommendation": info.get("recommendationKey"),
@@ -565,8 +621,11 @@ def get_analyst_ratings(symbol: str) -> dict:
             "target_low":     _safe_float(info.get("targetLowPrice")),
             "num_analysts":   info.get("numberOfAnalystOpinions"),
         }
-        rec = ticker.recommendations
-        if rec is not None and not rec.empty:
+        def _fetch_rec():
+            r = yf.Ticker(yf_symbol).recommendations
+            return r if r is not None and not r.empty else None
+        rec = _memo(("rec", yf_symbol), TTL_SLOW, _fetch_rec)
+        if rec is not None:
             latest = rec.iloc[-1]
             result["ratings_breakdown"] = {
                 "strong_buy":  int(latest.get("strongBuy",  0)),
@@ -632,8 +691,12 @@ def get_earnings_calendar(symbol: str) -> dict:
     """
     yf_symbol, _, _ = _resolve(symbol)
     try:
-        ticker = yf.Ticker(yf_symbol)
-        cal = ticker.calendar
+        def _fetch_cal():
+            c = yf.Ticker(yf_symbol).calendar
+            if c is None or (hasattr(c, "empty") and c.empty) or (isinstance(c, dict) and not c):
+                return None
+            return c
+        cal = _memo(("cal", yf_symbol), TTL_SLOW, _fetch_cal)
 
         def _fmt_date(val):
             if val is None:
@@ -683,8 +746,8 @@ def compare_stocks(symbols: list[str], period: str = "1y") -> dict:
     for raw in symbols:
         yf_symbol, _, _ = _resolve(raw)
         try:
-            hist = yf.Ticker(yf_symbol).history(period=period)
-            if hist.empty or len(hist) < 2:
+            hist = _yf_history(yf_symbol, period)
+            if hist is None or len(hist) < 2:
                 results.append({"symbol": yf_symbol, "input": raw, "error": "資料不足"})
                 continue
             start = float(hist["Close"].iloc[0])
@@ -721,10 +784,16 @@ def get_institutional_holders(symbol: str) -> dict:
     """
     yf_symbol, _, _ = _resolve(symbol)
     try:
-        ticker = yf.Ticker(yf_symbol)
+        def _fetch_inst():
+            i = yf.Ticker(yf_symbol).institutional_holders
+            return i if i is not None and not i.empty else None
 
-        inst = ticker.institutional_holders
-        major = ticker.major_holders
+        def _fetch_major():
+            m = yf.Ticker(yf_symbol).major_holders
+            return m if m is not None and not m.empty else None
+
+        inst = _memo(("inst", yf_symbol), TTL_SLOW, _fetch_inst)
+        major = _memo(("major", yf_symbol), TTL_SLOW, _fetch_major)
 
         top = []
         if inst is not None and not inst.empty:
