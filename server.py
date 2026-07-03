@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import time as dtime
@@ -97,7 +98,9 @@ TTL_SLOW    = 3600    # dividends / recommendations / calendar / holders
 
 def _memo(key: tuple, ttl: int, fn):
     """Return cached value for key if fresh; otherwise call fn and cache a
-    non-None result. fn must return None on failure so errors are retried."""
+    non-None result. fn must return None on failure. On failure with an
+    expired entry present, serve the stale value (stale-while-error) so a
+    Yahoo rate limit degrades to slightly old data instead of an error."""
     hit = _CACHE.get(key)
     now = time.time()
     if hit and now - hit[0] < ttl:
@@ -107,19 +110,27 @@ def _memo(key: tuple, ttl: int, fn):
         if len(_CACHE) > 500:
             _CACHE.clear()
         _CACHE[key] = (now, val)
-    return val
+        return val
+    return hit[1] if hit else None
 
 
 def _yf_info(symbol: str) -> dict:
     def fetch():
-        info = yf.Ticker(symbol).info
-        return info if info else None
+        try:
+            info = yf.Ticker(symbol).info
+        except Exception:
+            return None
+        # rate-limited responses come back empty or nearly empty
+        return info if info and len(info) > 2 else None
     return _memo(("info", symbol), TTL_INFO, fetch) or {}
 
 
 def _yf_history(symbol: str, period: str):
     def fetch():
-        df = yf.Ticker(symbol).history(period=period)
+        try:
+            df = yf.Ticker(symbol).history(period=period)
+        except Exception:
+            return None
         return df if not df.empty else None
     return _memo(("hist", symbol, period), TTL_HISTORY, fetch)
 
@@ -270,6 +281,52 @@ def _fetch_finviz_news_uncached(symbol: str, limit: int) -> list[dict] | None:
             if len(items) >= limit:
                 break
         return items or None
+    except Exception:
+        return None
+
+
+def _fetch_finviz_snapshot(symbol: str) -> dict | None:
+    """Scrape the key-value snapshot table from a Finviz quote page (US only).
+    Independent quota from Yahoo, so it serves as a rate-limit fallback."""
+    return _memo(("fvsnap", symbol), TTL_INFO, lambda: _fetch_finviz_snapshot_uncached(symbol))
+
+
+def _fetch_finviz_snapshot_uncached(symbol: str) -> dict | None:
+    url = f"https://finviz.com/quote.ashx?t={symbol}&p=d"
+    try:
+        resp = requests.get(url, headers={"User-Agent": _BROWSER_UA}, timeout=10)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Finviz splits the snapshot into multiple snapshot-table2 tables
+        snap: dict[str, str] = {}
+        for table in soup.find_all("table", class_="snapshot-table2"):
+            cells = [td.get_text(strip=True) for td in table.find_all("td")]
+            snap.update(zip(cells[::2], cells[1::2]))
+        return snap or None
+    except Exception:
+        return None
+
+
+def _fv_leading_num(val: str | None) -> float | None:
+    """Extract the leading number from concatenated Finviz values
+    like '236.54-17.63%' (price followed by distance %)."""
+    # Finviz prices always have 2 decimals; the change % is glued right after
+    m = re.match(r"-?\d+(\.\d{2})?", val or "")
+    return float(m.group()) if m else None
+
+
+def _fv_num(val: str | None) -> float | None:
+    """Parse Finviz numeric strings: '301.50', '1.85B', '2.50%', '-'."""
+    if not val or val == "-":
+        return None
+    v = val.replace(",", "").rstrip("%")
+    mult = 1.0
+    if v and v[-1] in "KMBT":
+        mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[v[-1]]
+        v = v[:-1]
+    try:
+        return round(float(v) * mult, 4)
     except Exception:
         return None
 
@@ -464,10 +521,35 @@ def get_fundamentals(symbol: str) -> dict:
     - debt_to_equity：負債權益比
     - current_ratio：流動比率
     - 52w_high / 52w_low：52 週高低點
+
+    資料來源以 Yahoo 為主；美股在 Yahoo 被限流時自動 fallback 到 Finviz。
     """
-    yf_symbol, _, _ = _resolve(symbol)
+    yf_symbol, _, market = _resolve(symbol)
     try:
         info = _yf_info(yf_symbol)
+
+        # Yahoo rate-limited → Finviz snapshot fallback (US only)
+        if not info and market == "US":
+            snap = _fetch_finviz_snapshot(yf_symbol)
+            if snap:
+                pct = lambda v: round(v / 100, 4) if v is not None else None
+                return {
+                    "symbol":           yf_symbol,
+                    "source":           "Finviz (Yahoo rate limited)",
+                    "pe_trailing":      _fv_num(snap.get("P/E")),
+                    "pe_forward":       _fv_num(snap.get("Forward P/E")),
+                    "eps_ttm":          _fv_num(snap.get("EPS (ttm)")),
+                    "market_cap":       _fv_num(snap.get("Market Cap")),
+                    "gross_margin":     pct(_fv_num(snap.get("Gross Margin"))),
+                    "operating_margin": pct(_fv_num(snap.get("Oper. Margin"))),
+                    "roe":              pct(_fv_num(snap.get("ROE"))),
+                    "roa":              pct(_fv_num(snap.get("ROA"))),
+                    "debt_to_equity":   _fv_num(snap.get("Debt/Eq")),
+                    "current_ratio":    _fv_num(snap.get("Current Ratio")),
+                    "52w_high":         _fv_leading_num(snap.get("52W High")),
+                    "52w_low":          _fv_leading_num(snap.get("52W Low")),
+                }
+
         return {
             "symbol":           yf_symbol,
             "pe_trailing":      _safe_float(info.get("trailingPE")),
@@ -609,8 +691,11 @@ def get_analyst_ratings(symbol: str) -> dict:
     - target_price / target_high / target_low：目標價（平均 / 最高 / 最低）
     - num_analysts：覆蓋分析師人數
     - ratings_breakdown：最新一期 Strong Buy / Buy / Hold / Sell / Strong Sell 人數分佈
+
+    資料來源以 Yahoo 為主；美股在 Yahoo 被限流時自動 fallback 到 Finviz
+    （此時只有 target_price 與 recommendation，source 欄位會標示 Finviz）。
     """
-    yf_symbol, _, _ = _resolve(symbol)
+    yf_symbol, _, market = _resolve(symbol)
     try:
         info = _yf_info(yf_symbol)
         result = {
@@ -622,7 +707,10 @@ def get_analyst_ratings(symbol: str) -> dict:
             "num_analysts":   info.get("numberOfAnalystOpinions"),
         }
         def _fetch_rec():
-            r = yf.Ticker(yf_symbol).recommendations
+            try:
+                r = yf.Ticker(yf_symbol).recommendations
+            except Exception:
+                return None
             return r if r is not None and not r.empty else None
         rec = _memo(("rec", yf_symbol), TTL_SLOW, _fetch_rec)
         if rec is not None:
@@ -634,6 +722,23 @@ def get_analyst_ratings(symbol: str) -> dict:
                 "sell":        int(latest.get("sell",        0)),
                 "strong_sell": int(latest.get("strongSell", 0)),
             }
+
+        # Yahoo rate-limited → Finviz snapshot fallback (US only)
+        if result["target_price"] is None and market == "US":
+            snap = _fetch_finviz_snapshot(yf_symbol)
+            if snap:
+                result["target_price"] = _fv_num(snap.get("Target Price"))
+                recom = _fv_num(snap.get("Recom"))
+                if result["recommendation"] is None and recom is not None:
+                    result["recommendation"] = (
+                        "strong_buy" if recom < 1.5 else
+                        "buy"        if recom < 2.5 else
+                        "hold"       if recom < 3.5 else
+                        "sell"       if recom < 4.5 else "strong_sell"
+                    )
+                    result["recom_score"] = recom  # Finviz 1(強力買進)–5(強力賣出)
+                result["source"] = "Finviz (Yahoo rate limited)"
+
         return result
     except Exception as e:
         return {"error": str(e)}
