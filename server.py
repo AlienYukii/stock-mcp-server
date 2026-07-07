@@ -3,7 +3,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import time as dtime
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytz
@@ -85,6 +85,20 @@ _ALIASES: dict[str, str] = {
 }
 
 
+# ── FOMC meeting schedule (published ~2 years ahead by the Fed) ──────────────
+# Update annually from https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+_FOMC_MEETINGS: list[tuple[str, str]] = [
+    ("2026-01-27", "2026-01-28"),
+    ("2026-03-17", "2026-03-18"),
+    ("2026-04-28", "2026-04-29"),
+    ("2026-06-16", "2026-06-17"),
+    ("2026-07-28", "2026-07-29"),
+    ("2026-09-15", "2026-09-16"),
+    ("2026-10-27", "2026-10-28"),
+    ("2026-12-08", "2026-12-09"),
+]
+
+
 # ── TTL cache: Yahoo rate-limits Render's shared egress IPs aggressively, so
 # every yfinance result is cached; only successful fetches are stored ─────────
 _CACHE: dict[tuple, tuple[float, object]] = {}
@@ -136,6 +150,10 @@ def _yf_history(symbol: str, period: str):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _now_utc_str() -> str:
+    return datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 
 def _is_market_open(market: str) -> bool:
     now_utc = datetime.now(pytz.UTC)
@@ -201,7 +219,18 @@ def _fetch_fugle(symbol: str) -> dict | None:
             return None
         prev = data.get("previousClose") or 0
         change_pct = round((float(price) - float(prev)) / float(prev) * 100, 2) if prev else None
-        return {"symbol": symbol, "price": float(price), "change_pct": change_pct, "currency": "TWD", "source": "Fugle"}
+        # lastUpdated is epoch microseconds
+        price_time = None
+        ts = data.get("lastUpdated")
+        if ts:
+            try:
+                price_time = datetime.fromtimestamp(
+                    float(ts) / 1e6, pytz.timezone("Asia/Taipei")
+                ).strftime("%Y-%m-%d %H:%M:%S %Z")
+            except Exception:
+                pass
+        return {"symbol": symbol, "price": float(price), "change_pct": change_pct, "currency": "TWD",
+                "source": "Fugle", "price_time": price_time, "fetched_at": _now_utc_str()}
     except Exception:
         return None
 
@@ -230,7 +259,11 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
         if prev is None and len(hist) >= 2:
             prev = float(hist["Close"].iloc[-2])
         change_pct = round((price - float(prev)) / float(prev) * 100, 2) if prev else None
-        return {"symbol": symbol, "price": price, "change_pct": change_pct, "currency": currency, "source": "yfinance"}
+        # yfinance localizes the index to the exchange timezone
+        last_bar = hist.index[-1]
+        price_time = last_bar.strftime("%Y-%m-%d %H:%M %Z") if hasattr(last_bar, "strftime") else str(last_bar)
+        return {"symbol": symbol, "price": price, "change_pct": change_pct, "currency": currency,
+                "source": "yfinance", "price_time": price_time, "fetched_at": _now_utc_str()}
     except Exception:
         return None
 
@@ -368,6 +401,30 @@ def _fetch_google_news_uncached(query: str, hl: str, gl: str, ceid: str, limit: 
         return None
 
 
+def _fetch_earnings_cal(yf_symbol: str):
+    def _fetch_cal():
+        try:
+            c = yf.Ticker(yf_symbol).calendar
+        except Exception:
+            return None
+        if c is None or (hasattr(c, "empty") and c.empty) or (isinstance(c, dict) and not c):
+            return None
+        return c
+    return _memo(("cal", yf_symbol), TTL_SLOW, _fetch_cal)
+
+
+def _earnings_dates_from_cal(cal) -> list[str]:
+    if not isinstance(cal, dict):
+        return []
+    dates = cal.get("Earnings Date", [])
+    if hasattr(dates, "tolist"):
+        dates = dates.tolist()
+    if not isinstance(dates, list):
+        dates = [dates]
+    return [d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+            for d in dates if d is not None]
+
+
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -387,6 +444,11 @@ def get_stock_price(symbol: str) -> dict:
       美股：AMZN/GOOGL/NVDA/INTC/TSLA/AMD/MSFT/SNDK/MU/TSM/DELL/SPY
       韓股：SMSN（三星）/SKH（SK海力士）
     開盤中只回傳正股，收盤後正股 + token 一起回傳。
+
+    資料時間戳：
+    - price_time：這筆報價本身的時間（交易所當地時間；Fugle 為即時，yfinance 約延遲 15 分鐘）
+    - fetched_at：server 實際向資料源抓取的時間（UTC）。因為有 60 秒快取，
+      fetched_at 較舊代表回的是快取值；限流時可能回更舊的 stale 資料，以此欄位判斷新鮮度。
     """
     yf_symbol, token_key, market = _resolve(symbol)
 
@@ -444,6 +506,7 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
     - ma_5 / ma_20 / ma_60：移動平均線
     - bb_upper / bb_mid / bb_lower：布林通道
     - volume：最新成交量
+    - data_date：指標計算所用最後一根 K 棒的日期
     - chart_url：（美股限定）Finviz 技術分析日線圖連結
     """
     yf_symbol, _, market = _resolve(symbol)
@@ -480,9 +543,11 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
         bb_upper = sma20 + 2 * std20
         bb_lower = sma20 - 2 * std20
 
+        last_bar = df.index[-1]
         result = {
             "symbol": yf_symbol,
             "period": period,
+            "data_date": last_bar.strftime("%Y-%m-%d") if hasattr(last_bar, "strftime") else str(last_bar),
             "last_close": _safe_float(close.iloc[-1]),
             "volume": int(df["Volume"].iloc[-1]) if not pd.isna(df["Volume"].iloc[-1]) else None,
             "rsi_14":      _safe_float(rsi),
@@ -757,7 +822,8 @@ def get_market_overview() -> dict:
     - 費城半導體（^SOX）
     - VIX 恐慌指數（^VIX）
 
-    每個指數回傳：price、change_pct、currency
+    每個指數回傳：price、change_pct、currency、price_time（該報價的交易所當地時間）
+    頂層 as_of 為本次回應產生時間（UTC）。
     """
     _INDICES = {
         "台灣加權 TWII": "^TWII",
@@ -767,7 +833,7 @@ def get_market_overview() -> dict:
         "費半 SOX":      "^SOX",
         "VIX":           "^VIX",
     }
-    result = {}
+    result = {"as_of": _now_utc_str()}
     for name, sym in _INDICES.items():
         data = _fetch_yf(sym)
         if data:
@@ -776,6 +842,7 @@ def get_market_overview() -> dict:
                 "price":      data["price"],
                 "change_pct": data.get("change_pct"),
                 "currency":   data.get("currency", "USD"),
+                "price_time": data.get("price_time"),
             }
         else:
             result[name] = {"symbol": sym, "error": "無法取得"}
@@ -796,32 +863,16 @@ def get_earnings_calendar(symbol: str) -> dict:
     """
     yf_symbol, _, _ = _resolve(symbol)
     try:
-        def _fetch_cal():
-            c = yf.Ticker(yf_symbol).calendar
-            if c is None or (hasattr(c, "empty") and c.empty) or (isinstance(c, dict) and not c):
-                return None
-            return c
-        cal = _memo(("cal", yf_symbol), TTL_SLOW, _fetch_cal)
-
-        def _fmt_date(val):
-            if val is None:
-                return None
-            if hasattr(val, "strftime"):
-                return val.strftime("%Y-%m-%d")
-            return str(val)
+        cal = _fetch_earnings_cal(yf_symbol)
 
         if cal is None or (hasattr(cal, "empty") and cal.empty):
             return {"symbol": yf_symbol, "error": "無財報行事曆資料"}
 
         # yfinance returns a dict
         if isinstance(cal, dict):
-            earnings_dates = cal.get("Earnings Date", [])
-            if hasattr(earnings_dates, "tolist"):
-                earnings_dates = earnings_dates.tolist()
-            dates = [_fmt_date(d) for d in (earnings_dates if isinstance(earnings_dates, list) else [earnings_dates])]
             return {
                 "symbol":           yf_symbol,
-                "earnings_date":    dates,
+                "earnings_date":    _earnings_dates_from_cal(cal),
                 "eps_estimate":     _safe_float(cal.get("EPS Estimate")),
                 "revenue_estimate": cal.get("Revenue Estimate"),
             }
@@ -831,6 +882,55 @@ def get_earnings_calendar(symbol: str) -> dict:
 
     except Exception as e:
         return {"error": str(e)}
+
+
+@mcp.tool()
+def get_market_calendar(symbols: list[str] | None = None, days: int = 45) -> dict:
+    """
+    查詢近期市場重要事件行事曆：FOMC 會議日程 + 指定股票的下次財報日。
+    追蹤「7/28-29 FOMC」「台積電財報日」這類日期時用這個工具，不要靠記憶。
+
+    參數：
+    - symbols：（選填）要查財報日的股票清單，台美韓股與中文別名皆可，
+      如 ['TSM', '2330', 'NVDA', '蘋果']。不傳則只回傳總經事件。
+    - days：往後看的天數範圍（預設 45 天）
+
+    回傳：
+    - as_of：本次回應產生時間（UTC）
+    - macro_events：範圍內的 FOMC 會議（start / end / note；利率決策在會議
+      第二天美東時間 14:00 公布）
+    - earnings：每檔股票的下次財報日（yfinance 提供，可能為日期區間；
+      美股較準，台韓股可能缺資料）
+    """
+    today = date.today()
+    horizon = today + timedelta(days=max(int(days), 1))
+
+    macro_events = []
+    for start, end in _FOMC_MEETINGS:
+        if today <= date.fromisoformat(end) and date.fromisoformat(start) <= horizon:
+            macro_events.append({
+                "event": "FOMC 會議",
+                "start": start,
+                "end":   end,
+                "note":  "利率決策於會議第二天美東 14:00 公布",
+            })
+
+    earnings: dict[str, dict] = {}
+    for raw in (symbols or []):
+        yf_symbol, _, _ = _resolve(raw)
+        cal = _fetch_earnings_cal(yf_symbol)
+        dates = _earnings_dates_from_cal(cal) if cal is not None else []
+        if dates:
+            earnings[yf_symbol] = {"input": raw, "earnings_date": dates}
+        else:
+            earnings[yf_symbol] = {"input": raw, "error": "無財報日資料"}
+
+    return {
+        "as_of":        _now_utc_str(),
+        "window_days":  days,
+        "macro_events": macro_events,
+        "earnings":     earnings,
+    }
 
 
 @mcp.tool()
