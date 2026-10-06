@@ -256,16 +256,30 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
         except Exception:
             currency = "USD"
             prev = None
-        if prev is None and len(hist) >= 2:
+        change_basis = "previous_close"
+        if _is_near_24h(symbol):
+            # fast_info.previous_close is unreliable for ~24h instruments (futures/FX);
+            # use daily close-to-close instead.
+            daily = ticker.history(period="7d", interval="1d")["Close"].dropna()
+            if len(daily) >= 2:
+                prev = float(daily.iloc[-2])
+                change_basis = "daily_close_to_close"
+        elif prev is None and len(hist) >= 2:
             prev = float(hist["Close"].iloc[-2])
         change_pct = round((price - float(prev)) / float(prev) * 100, 2) if prev else None
         # yfinance localizes the index to the exchange timezone
         last_bar = hist.index[-1]
         price_time = last_bar.strftime("%Y-%m-%d %H:%M %Z") if hasattr(last_bar, "strftime") else str(last_bar)
-        return {"symbol": symbol, "price": price, "change_pct": change_pct, "currency": currency,
-                "source": "yfinance", "price_time": price_time, "fetched_at": _now_utc_str()}
+        return {"symbol": symbol, "price": price, "change_pct": change_pct, "change_basis": change_basis,
+                "currency": currency, "source": "yfinance", "price_time": price_time,
+                "fetched_at": _now_utc_str()}
     except Exception:
         return None
+
+
+def _is_near_24h(symbol: str) -> bool:
+    s = symbol.upper()
+    return s.endswith("=F") or s.endswith("=X") or s.endswith(".NYB")
 
 
 _BROWSER_UA = (
@@ -821,8 +835,9 @@ def get_market_overview() -> dict:
     - 道瓊（^DJI）
     - 費城半導體（^SOX）
     - VIX 恐慌指數（^VIX）
+    - 美元指數（DXY）、黃金（GC=F）、WTI 原油（CL=F）
 
-    每個指數回傳：price、change_pct、currency、price_time（該報價的交易所當地時間）
+    每個指數回傳：price、change_pct、change_basis（漲跌幅算法）、currency、price_time（該報價的交易所當地時間）
     頂層 as_of 為本次回應產生時間（UTC）。
     """
     _INDICES = {
@@ -832,6 +847,9 @@ def get_market_overview() -> dict:
         "道瓊 DJI":      "^DJI",
         "費半 SOX":      "^SOX",
         "VIX":           "^VIX",
+        "美元指數 DXY":   "DX-Y.NYB",
+        "黃金 GOLD":     "GC=F",
+        "原油 WTI":      "CL=F",
     }
     result = {"as_of": _now_utc_str()}
     for name, sym in _INDICES.items():
@@ -841,6 +859,7 @@ def get_market_overview() -> dict:
                 "symbol":     sym,
                 "price":      data["price"],
                 "change_pct": data.get("change_pct"),
+                "change_basis": data.get("change_basis"),
                 "currency":   data.get("currency", "USD"),
                 "price_time": data.get("price_time"),
             }
