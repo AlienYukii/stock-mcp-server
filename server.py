@@ -252,20 +252,30 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
         try:
             info = ticker.fast_info
             currency = getattr(info, "currency", None) or "USD"
+            # fast_info.previous_close is unreliable (often not the prior session's close);
+            # regular_market_previous_close matches the daily bars.
+            reg_prev = getattr(info, "regular_market_previous_close", None)
             prev = getattr(info, "previous_close", None)
         except Exception:
             currency = "USD"
+            reg_prev = None
             prev = None
         change_basis = "previous_close"
-        if _is_near_24h(symbol):
-            # fast_info.previous_close is unreliable for ~24h instruments (futures/FX);
-            # use daily close-to-close instead.
+        if is_index or _is_near_24h(symbol):
+            # Indices and ~24h instruments (futures/FX): daily close-to-close.
+            daily = hist["Close"] if is_index else ticker.history(period="7d", interval="1d")["Close"]
+            daily = daily.dropna()
+            if len(daily) >= 2:
+                prev = float(daily.iloc[-2])
+                change_basis = "daily_close_to_close"
+        elif reg_prev:
+            prev = reg_prev
+            change_basis = "regular_market_previous_close"
+        else:
             daily = ticker.history(period="7d", interval="1d")["Close"].dropna()
             if len(daily) >= 2:
                 prev = float(daily.iloc[-2])
                 change_basis = "daily_close_to_close"
-        elif prev is None and len(hist) >= 2:
-            prev = float(hist["Close"].iloc[-2])
         change_pct = round((price - float(prev)) / float(prev) * 100, 2) if prev else None
         # yfinance localizes the index to the exchange timezone
         last_bar = hist.index[-1]
