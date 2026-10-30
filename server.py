@@ -1052,14 +1052,17 @@ if __name__ == "__main__":
     import uvicorn
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
-    from starlette.routing import Mount, Route
+    from starlette.routing import Route
 
     async def health(request):
         return JSONResponse({"status": "ok"})
 
     port = int(os.environ.get("PORT", 8000))
-    app = Starlette(routes=[
-        Route("/health", health),
-        Mount("/", app=mcp.sse_app()),
-    ])
+    # Serve both transports: SSE (/sse, /messages) and Streamable HTTP (/mcp).
+    sse_app = mcp.sse_app()
+    http_app = mcp.streamable_http_app()
+    app = Starlette(
+        routes=[Route("/health", health), *sse_app.routes, *http_app.routes],
+        lifespan=http_app.router.lifespan_context,  # starts the Streamable HTTP session manager
+    )
     uvicorn.run(app, host="0.0.0.0", port=port)
