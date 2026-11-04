@@ -180,9 +180,9 @@ def _resolve(raw: str) -> tuple[str, str | None, str]:
     if s in _KR_ALIAS_MAP:
         return _KR_ALIAS_MAP[s], s, "KR"
 
-    # TW: 4-5 digit number
+    # TW: 4-5 digit number, or 5 digits + letter (new ETF codes like 00981A)
     clean_tw = s.replace(".TW", "").replace(".TWO", "")
-    if clean_tw.isdigit() and len(clean_tw) in (4, 5):
+    if (clean_tw.isdigit() and len(clean_tw) in (4, 5)) or re.fullmatch(r"\d{5}[A-Z]", clean_tw):
         return f"{clean_tw}.TW", None, "TW"
 
     # KR: 6-digit number
@@ -207,18 +207,26 @@ def _safe_float(val) -> float | None:
         return None
 
 
-def _fetch_fugle(symbol: str) -> dict | None:
+def _fetch_fugle(symbol: str, allow_reference: bool = False) -> dict | None:
+    """Fugle intraday quote. Before the first trade there is no lastPrice, only a
+    reference price (= previous close), which would show a misleading 0% change;
+    return None in that case unless allow_reference (last-resort fallback)."""
     url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{symbol}"
     try:
         resp = requests.get(url, headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10)
         if resp.status_code != 200:
             return None
         data = resp.json()
-        price = data.get("lastPrice") or data.get("closePrice") or data.get("referencePrice")
+        price = data.get("lastPrice") or data.get("closePrice")
+        traded = bool(price)
+        if not traded:
+            if not allow_reference:
+                return None
+            price = data.get("referencePrice")
         if not price:
             return None
         prev = data.get("previousClose") or 0
-        change_pct = round((float(price) - float(prev)) / float(prev) * 100, 2) if prev else None
+        change_pct = round((float(price) - float(prev)) / float(prev) * 100, 2) if prev and traded else None
         # lastUpdated is epoch microseconds
         price_time = None
         ts = data.get("lastUpdated")
@@ -229,8 +237,11 @@ def _fetch_fugle(symbol: str) -> dict | None:
                 ).strftime("%Y-%m-%d %H:%M:%S %Z")
             except Exception:
                 pass
-        return {"symbol": symbol, "price": float(price), "change_pct": change_pct, "currency": "TWD",
-                "source": "Fugle", "price_time": price_time, "fetched_at": _now_utc_str()}
+        out = {"symbol": symbol, "price": float(price), "change_pct": change_pct, "currency": "TWD",
+               "source": "Fugle", "price_time": price_time, "fetched_at": _now_utc_str()}
+        if not traded:
+            out["note"] = "尚未成交,price 為參考價(前一交易日收盤),change_pct 不適用"
+        return out
     except Exception:
         return None
 
@@ -260,6 +271,9 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
             currency = "USD"
             reg_prev = None
             prev = None
+        # new listings can return NaN (truthy) here; treat as missing
+        reg_prev = None if reg_prev is None or pd.isna(reg_prev) else reg_prev
+        prev = None if prev is None or pd.isna(prev) else prev
         change_basis = "previous_close"
         if is_index or _is_near_24h(symbol):
             # Indices and ~24h instruments (futures/FX): daily close-to-close.
@@ -276,13 +290,31 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
             if len(daily) >= 2:
                 prev = float(daily.iloc[-2])
                 change_basis = "daily_close_to_close"
-        change_pct = round((price - float(prev)) / float(prev) * 100, 2) if prev else None
         # yfinance localizes the index to the exchange timezone
         last_bar = hist.index[-1]
+        price_type = "last_trade"
+        if is_index:
+            price_type = "index_level"
+        elif _is_near_24h(symbol):
+            price_type = "electronic_last"
+        else:
+            # After the close the last 1m bar is the last trade before the closing
+            # auction; swap in the official daily close so price matches TA/last_close.
+            official = _official_close(ticker, symbol, last_bar)
+            if official is not None:
+                price, price_type = official, "official_close"
+        change_pct = round((price - float(prev)) / float(prev) * 100, 2) if prev else None
         price_time = last_bar.strftime("%Y-%m-%d %H:%M %Z") if hasattr(last_bar, "strftime") else str(last_bar)
-        return {"symbol": symbol, "price": price, "change_pct": change_pct, "change_basis": change_basis,
-                "currency": currency, "source": "yfinance", "price_time": price_time,
-                "fetched_at": _now_utc_str()}
+        out = {"symbol": symbol, "price": price, "change_pct": change_pct, "change_basis": change_basis,
+               "prev_close": round(float(prev), 4) if prev else None, "price_type": price_type,
+               "currency": currency, "source": "yfinance", "price_time": price_time,
+               "fetched_at": _now_utc_str()}
+        if price_type == "electronic_last":
+            out["price_note"] = "電子盤/連續報價,非交易所結算價;prev_close 為前一日日線收盤(結算)價"
+        warn = _stale_warning(last_bar)
+        if warn:
+            out["stale_warning"] = warn
+        return out
     except Exception:
         return None
 
@@ -290,6 +322,45 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
 def _is_near_24h(symbol: str) -> bool:
     s = symbol.upper()
     return s.endswith("=F") or s.endswith("=X") or s.endswith(".NYB")
+
+
+# (hour, minute) of the final 1m bar of the regular session, by exchange suffix
+_FINAL_MIN_BAR = {".TW": (13, 24), ".TWO": (13, 24), ".KS": (15, 29), ".KQ": (15, 29)}
+
+
+def _official_close(ticker, symbol: str, last_bar) -> float | None:
+    """If last_bar is the final 1m bar of a finished regular session, return that
+    day's official daily close (includes the closing auction); otherwise None."""
+    try:
+        if not (last_bar.hour or last_bar.minute):
+            return None  # daily bar, nothing to replace
+        suffix = next((k for k in _FINAL_MIN_BAR if symbol.upper().endswith(k)), None)
+        final = _FINAL_MIN_BAR.get(suffix, (15, 59))
+        if (last_bar.hour, last_bar.minute) < final:
+            return None
+        daily = ticker.history(period="5d", interval="1d")["Close"].dropna()
+        if len(daily) and daily.index[-1].date() == last_bar.date():
+            return float(daily.iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
+def _stale_warning(last_bar) -> str | None:
+    """Warn when the latest bar is older than the previous weekday in the bar's own
+    timezone. Soft check: exchange holidays can trigger a false positive."""
+    try:
+        today = datetime.now(last_bar.tzinfo).date()
+        while today.weekday() >= 5:
+            today -= timedelta(days=1)
+        prev_day = today - timedelta(days=1)
+        while prev_day.weekday() >= 5:
+            prev_day -= timedelta(days=1)
+        if last_bar.date() < prev_day:
+            return f"最新資料日期 {last_bar.date()} 落後(預期至少到 {prev_day}),資料源可能延遲,或期間休市"
+    except Exception:
+        pass
+    return None
 
 
 _BROWSER_UA = (
@@ -449,6 +520,28 @@ def _earnings_dates_from_cal(cal) -> list[str]:
             for d in dates if d is not None]
 
 
+def _finviz_earnings(yf_symbol: str) -> dict | None:
+    """Next earnings date from the Finviz snapshot ('Nov 17 AMC'); fallback when
+    Yahoo's calendar is rate-limited. US tickers only. Finviz keeps showing the
+    LAST report after it passes, so past dates are discarded."""
+    if "." in yf_symbol or yf_symbol.startswith("^"):
+        return None
+    snap = _fetch_finviz_snapshot(yf_symbol)
+    m = re.match(r"([A-Z][a-z]{2})\s+(\d{1,2})(?:\s+(AMC|BMO|DMH))?", (snap or {}).get("Earnings") or "")
+    if not m:
+        return None
+    today = date.today()
+    try:
+        d = datetime.strptime(f"{m.group(1)} {m.group(2)} {today.year}", "%b %d %Y").date()
+        if d < today:  # may be early next year; anything far away is last quarter's report
+            d = d.replace(year=today.year + 1)
+            if (d - today).days > 120:
+                return None
+    except ValueError:
+        return None
+    return {"earnings_date": [d.isoformat()], "timing": m.group(3), "source": "Finviz"}
+
+
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -479,7 +572,10 @@ def get_stock_price(symbol: str) -> dict:
     # Fetch main stock price
     if market == "TW":
         clean = yf_symbol.replace(".TW", "").replace(".TWO", "")
+        # Fugle (traded) → yfinance (last session's close + change) → Fugle reference price
         result = (_fetch_fugle(clean) if FUGLE_API_KEY else None) or _fetch_yf(yf_symbol)
+        if result is None and FUGLE_API_KEY:
+            result = _fetch_fugle(clean, allow_reference=True)
     else:
         result = _fetch_yf(yf_symbol)
 
@@ -497,6 +593,8 @@ def get_stock_price(symbol: str) -> dict:
                     "symbol": token_symbol,
                     "price": token_data["price"],
                     "change_pct": token_data.get("change_pct"),
+                    "change_basis": token_data.get("change_basis"),
+                    "change_note": "代幣 24h 交易,漲跌幅以前一日(UTC)收盤為基準,與正股的前一交易日收盤不同,方向可能相反",
                     "source": token_data["source"],
                 }
             result["market_status"] = "closed"
@@ -540,6 +638,10 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
         if df is None:
             return {"error": f"無法取得 {symbol} 歷史資料"}
 
+        # A NaN last bar (incomplete candle) would null out every rolling indicator
+        df = df.dropna(subset=["Close"])
+        if df.empty:
+            return {"error": f"無法取得 {symbol} 歷史資料"}
         close = df["Close"]
 
         # SMA
@@ -585,6 +687,10 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
             "bb_mid":      _safe_float(sma20.iloc[-1]),
             "bb_lower":    _safe_float(bb_lower.iloc[-1]),
         }
+
+        warn = _stale_warning(last_bar)
+        if warn:
+            result["stale_warning"] = warn
 
         if market == "US" and not yf_symbol.startswith("^"):
             result["chart_url"] = f"https://finviz.com/chart.ashx?t={yf_symbol}&ty=c&ta=1&p=d"
@@ -895,6 +1001,10 @@ def get_earnings_calendar(symbol: str) -> dict:
         cal = _fetch_earnings_cal(yf_symbol)
 
         if cal is None or (hasattr(cal, "empty") and cal.empty):
+            fv = _finviz_earnings(yf_symbol)
+            if fv:
+                return {"symbol": yf_symbol, **fv,
+                        "note": "Yahoo 無資料,改用 Finviz;timing: AMC=盤後、BMO=盤前,不含 EPS/營收預估"}
             return {"symbol": yf_symbol, "error": "無財報行事曆資料"}
 
         # yfinance returns a dict
@@ -949,8 +1059,11 @@ def get_market_calendar(symbols: list[str] | None = None, days: int = 45) -> dic
         yf_symbol, _, _ = _resolve(raw)
         cal = _fetch_earnings_cal(yf_symbol)
         dates = _earnings_dates_from_cal(cal) if cal is not None else []
+        fv = None if dates else _finviz_earnings(yf_symbol)
         if dates:
             earnings[yf_symbol] = {"input": raw, "earnings_date": dates}
+        elif fv:
+            earnings[yf_symbol] = {"input": raw, **fv}
         else:
             earnings[yf_symbol] = {"input": raw, "error": "無財報日資料"}
 
