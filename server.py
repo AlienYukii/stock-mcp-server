@@ -677,7 +677,7 @@ def _nasdaq_earnings(yf_symbol: str) -> dict | None:
 
 
 _STATUS_BASIS = {
-    "confirmed": "Nasdaq/Zacks 標示為 expected 且有盤前/盤後時段,代表公司已公布",
+    "confirmed": "推論:Nasdaq/Zacks 標示 expected 且附盤前/盤後時段,視為公司已公布(來源並未明說)",
     "estimated": "依歷史公布日推估,公司尚未公布確切日期",
     "unknown":   "來源未區分預計或確定",
 }
@@ -704,6 +704,14 @@ def _earnings_info(yf_symbol: str) -> dict:
         sources.append({"source": "Finviz", "earnings_date": fv["earnings_date"],
                         "date_status": "unknown", "timing": fv.get("timing")})
     if not sources:
+        last = fv.get("last_reported") if fv else None
+        if last:
+            # no source has the next date: extrapolate one quarter (~91 days) from the last report
+            est = date.fromisoformat(last) + timedelta(days=91)
+            if est >= date.today():
+                return {"earnings_date": [est.isoformat()], "date_status": "estimated",
+                        "status_basis": f"各來源都沒有下次日期,依上次財報日 {last} +91 天粗估(誤差可達數週)",
+                        "source": "extrapolated", "last_reported": last, "sources": []}
         out = {"status": "unavailable",
                "error": "資料源暫時抓不到下次財報日(Yahoo 失敗,備援也沒有),不代表沒有財報"}
         if fv and fv.get("last_reported"):
@@ -723,6 +731,11 @@ def _earnings_info(yf_symbol: str) -> dict:
         "sources":       sources,
     }
     firsts = sorted(date.fromisoformat(s["earnings_date"][0][:10]) for s in sources)
+    if primary["date_status"] == "confirmed":
+        p_date = date.fromisoformat(primary["earnings_date"][0][:10])
+        agree = any(abs((date.fromisoformat(s["earnings_date"][0][:10]) - p_date).days) <= 1
+                    for s in sources[1:])
+        out["status_basis"] += "；另有來源日期吻合" if agree else "；僅單一來源,未交叉驗證"
     if len(sources) > 1 and firsts[0] != firsts[-1]:
         if (firsts[-1] - firsts[0]).days == 1:
             out["date_note"] = "來源日期差一天:盤後公布時 Yahoo 常記為隔日(股價反應日),以 timing 與 sources 為準"
@@ -1257,9 +1270,15 @@ def get_market_calendar(symbols: list[str] | None = None, days: int = 45) -> dic
         if "earnings_date" in entry:
             try:
                 first = min(date.fromisoformat(d[:10]) for d in entry["earnings_date"])
-                entry["in_window"] = first <= horizon
-                if first > horizon:
-                    entry["note"] = f"下次財報日在查詢範圍({days} 天)之外"
+                rough = entry.get("source") == "extrapolated"
+                if rough and abs((first - horizon).days) <= 21:
+                    # extrapolation error is weeks: too close to the edge to call
+                    entry["in_window"] = None
+                    entry["note"] = f"僅能粗估(約 {first}),接近查詢範圍({days} 天)邊界,無法判斷是否在範圍內"
+                else:
+                    entry["in_window"] = first <= horizon
+                    if first > horizon:
+                        entry["note"] = f"下次財報日在查詢範圍({days} 天)之外" + ("(推估)" if rough else "")
             except ValueError:
                 pass
         earnings[yf_symbol] = entry
