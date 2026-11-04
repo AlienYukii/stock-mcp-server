@@ -1,5 +1,7 @@
 import os
+import random
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import time as dtime
@@ -11,6 +13,7 @@ import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
+from yfinance.exceptions import YFRateLimitError
 
 mcp = FastMCP("stock-prices", host="0.0.0.0")
 
@@ -128,25 +131,73 @@ def _memo(key: tuple, ttl: int, fn):
     return hit[1] if hit else None
 
 
+# ── Yahoo pacing / retry ──────────────────────────────────────────────────────
+# Render's shared egress IP gets 429s from Yahoo. Space calls out, retry a 429 a
+# couple of times, and after repeated failure fail fast for a while (so the cache's
+# stale-while-error and the Finviz/Nasdaq fallbacks take over instead of every tool
+# call sitting in retries). Note: sync tools block the event loop, so keep this short.
+YF_MIN_GAP  = 0.35   # seconds between Yahoo-bound calls
+YF_RETRIES  = 2      # extra attempts after a 429 (backoff ~1.5s, ~3s)
+YF_COOLDOWN = 20     # seconds to fail fast after retries are exhausted
+_yf_lock = threading.Lock()
+_yf_last_call = 0.0
+_yf_cooldown_until = 0.0
+
+
+def _yahoo(fn):
+    """Run a yfinance call paced, retrying on YFRateLimitError. Raises it if still limited."""
+    global _yf_last_call, _yf_cooldown_until
+    if time.time() < _yf_cooldown_until:
+        raise YFRateLimitError()
+    for attempt in range(YF_RETRIES + 1):
+        with _yf_lock:
+            gap = YF_MIN_GAP - (time.time() - _yf_last_call)
+            if gap > 0:
+                time.sleep(gap)
+            _yf_last_call = time.time()
+        try:
+            return fn()
+        except YFRateLimitError:
+            if attempt == YF_RETRIES:
+                _yf_cooldown_until = time.time() + YF_COOLDOWN
+                raise
+            time.sleep(1.5 * (attempt + 1) + random.random() * 0.5)
+
+
+def _yf_memo(key: tuple, ttl: int, fn):
+    """_memo for Yahoo-backed fetches. fn must let YFRateLimitError propagate; a 429
+    that survives the retries becomes None so _memo serves stale data if it has any."""
+    def run():
+        try:
+            return _yahoo(fn)
+        except YFRateLimitError:
+            return None
+    return _memo(key, ttl, run)
+
+
 def _yf_info(symbol: str) -> dict:
     def fetch():
         try:
             info = yf.Ticker(symbol).info
+        except YFRateLimitError:
+            raise
         except Exception:
             return None
         # rate-limited responses come back empty or nearly empty
         return info if info and len(info) > 2 else None
-    return _memo(("info", symbol), TTL_INFO, fetch) or {}
+    return _yf_memo(("info", symbol), TTL_INFO, fetch) or {}
 
 
 def _yf_history(symbol: str, period: str):
     def fetch():
         try:
             df = yf.Ticker(symbol).history(period=period)
+        except YFRateLimitError:
+            raise
         except Exception:
             return None
         return df if not df.empty else None
-    return _memo(("hist", symbol, period), TTL_HISTORY, fetch)
+    return _yf_memo(("hist", symbol, period), TTL_HISTORY, fetch)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -237,7 +288,10 @@ def _fetch_fugle(symbol: str, allow_reference: bool = False) -> dict | None:
                 ).strftime("%Y-%m-%d %H:%M:%S %Z")
             except Exception:
                 pass
-        out = {"symbol": symbol, "price": float(price), "change_pct": change_pct, "currency": "TWD",
+        price_type = "official_close" if data.get("closePrice") else ("last_trade" if traded else "reference_price")
+        out = {"symbol": symbol, "price": float(price), "change_pct": change_pct,
+               "change_basis": "fugle_previous_close", "prev_close": float(prev) if prev else None,
+               "price_type": price_type, "currency": "TWD",
                "source": "Fugle", "price_time": price_time, "fetched_at": _now_utc_str()}
         if not traded:
             out["note"] = "尚未成交,price 為參考價(前一交易日收盤),change_pct 不適用"
@@ -247,7 +301,7 @@ def _fetch_fugle(symbol: str, allow_reference: bool = False) -> dict | None:
 
 
 def _fetch_yf(symbol: str) -> dict | None:
-    return _memo(("price", symbol), TTL_PRICE, lambda: _fetch_yf_uncached(symbol))
+    return _yf_memo(("price", symbol), TTL_PRICE, lambda: _fetch_yf_uncached(symbol))
 
 
 def _fetch_yf_uncached(symbol: str) -> dict | None:
@@ -267,6 +321,8 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
             # regular_market_previous_close matches the daily bars.
             reg_prev = getattr(info, "regular_market_previous_close", None)
             prev = getattr(info, "previous_close", None)
+        except YFRateLimitError:
+            raise
         except Exception:
             currency = "USD"
             reg_prev = None
@@ -293,8 +349,10 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
         # yfinance localizes the index to the exchange timezone
         last_bar = hist.index[-1]
         price_type = "last_trade"
+        price_ts = last_bar
         if is_index:
-            price_type = "index_level"
+            # the last daily bar is still forming while the session is open
+            price_type = "index_intraday" if _bar_in_progress(symbol, last_bar) else "index_close"
         elif _is_near_24h(symbol):
             price_type = "electronic_last"
         else:
@@ -303,14 +361,17 @@ def _fetch_yf_uncached(symbol: str) -> dict | None:
             official = _official_close(ticker, symbol, last_bar)
             if official is not None:
                 price, price_type = official, "official_close"
+                price_ts = last_bar + timedelta(minutes=1)  # final bar 15:59 → close 16:00
         change_pct = round((price - float(prev)) / float(prev) * 100, 2) if prev else None
-        price_time = last_bar.strftime("%Y-%m-%d %H:%M %Z") if hasattr(last_bar, "strftime") else str(last_bar)
+        price_time = price_ts.strftime("%Y-%m-%d %H:%M %Z") if hasattr(price_ts, "strftime") else str(price_ts)
         out = {"symbol": symbol, "price": price, "change_pct": change_pct, "change_basis": change_basis,
                "prev_close": round(float(prev), 4) if prev else None, "price_type": price_type,
                "currency": currency, "source": "yfinance", "price_time": price_time,
                "fetched_at": _now_utc_str()}
         if price_type == "electronic_last":
             out["price_note"] = "電子盤/連續報價,非交易所結算價;prev_close 為前一日日線收盤(結算)價"
+        elif price_type == "index_intraday":
+            out["price_note"] = "盤中值,今日 K 棒尚未收完(price_time 的 00:00 只是日期),非收盤價"
         warn = _stale_warning(last_bar)
         if warn:
             out["stale_warning"] = warn
@@ -344,6 +405,25 @@ def _official_close(ticker, symbol: str, last_bar) -> float | None:
     except Exception:
         pass
     return None
+
+
+# (hour, minute) when the regular session ends, by symbol suffix / index; default US 16:00
+_SESSION_END = {".TW": (13, 30), ".TWO": (13, 30), "^TWII": (13, 30),
+                ".KS": (15, 30), ".KQ": (15, 30), "^KS11": (15, 30), "^KQ11": (15, 30)}
+
+
+def _bar_in_progress(symbol: str, last_bar) -> bool:
+    """True if last_bar is today's daily bar and the regular session is still open,
+    i.e. the bar is still forming and its Close is an intraday value."""
+    try:
+        now = datetime.now(last_bar.tzinfo)
+        if now.weekday() >= 5 or last_bar.date() != now.date():
+            return False
+        key = next((k for k in _SESSION_END if symbol.upper().endswith(k) or symbol.upper() == k), None)
+        end = _SESSION_END.get(key, (16, 0))
+        return now.time() < dtime(*end)
+    except Exception:
+        return False
 
 
 def _stale_warning(last_bar) -> str | None:
@@ -500,12 +580,14 @@ def _fetch_earnings_cal(yf_symbol: str):
     def _fetch_cal():
         try:
             c = yf.Ticker(yf_symbol).calendar
+        except YFRateLimitError:
+            raise
         except Exception:
             return None
         if c is None or (hasattr(c, "empty") and c.empty) or (isinstance(c, dict) and not c):
             return None
         return c
-    return _memo(("cal", yf_symbol), TTL_SLOW, _fetch_cal)
+    return _yf_memo(("cal", yf_symbol), TTL_SLOW, _fetch_cal)
 
 
 def _earnings_dates_from_cal(cal) -> list[str]:
@@ -534,12 +616,119 @@ def _finviz_earnings(yf_symbol: str) -> dict | None:
     try:
         d = datetime.strptime(f"{m.group(1)} {m.group(2)} {today.year}", "%b %d %Y").date()
         if d < today:  # may be early next year; anything far away is last quarter's report
-            d = d.replace(year=today.year + 1)
-            if (d - today).days > 120:
-                return None
+            nxt = d.replace(year=today.year + 1)
+            if (nxt - today).days > 120:
+                return {"last_reported": d.isoformat(), "source": "Finviz"}
+            d = nxt
     except ValueError:
         return None
     return {"earnings_date": [d.isoformat()], "timing": m.group(3), "source": "Finviz"}
+
+
+_NASDAQ_HEADERS = {
+    "User-Agent": _BROWSER_UA, "Accept": "application/json",
+    "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/",
+}
+_NASDAQ_TIMING = {"after market close": "AMC", "before market open": "BMO", "during market hours": "DMH"}
+
+
+def _nasdaq_earnings(yf_symbol: str) -> dict | None:
+    """Next earnings date from Nasdaq's public API (Zacks data). US tickers only.
+    Unlike Yahoo/Finviz it says whether the date is an algorithmic estimate or announced.
+    Returns {} when Nasdaq has no date (cached), None on request failure."""
+    if "." in yf_symbol or "=" in yf_symbol or "-" in yf_symbol or yf_symbol.startswith("^"):
+        return None
+
+    def fetch():
+        text = None
+        for attempt in range(2):  # the API fails now and then; one quick retry is enough
+            try:
+                resp = requests.get(f"https://api.nasdaq.com/api/analyst/{yf_symbol}/earnings-date",
+                                    headers=_NASDAQ_HEADERS, timeout=10)
+                if resp.status_code == 200:
+                    text = (resp.json().get("data") or {}).get("reportText") or ""
+                    break
+            except Exception:
+                pass
+            time.sleep(0.6)
+        if text is None:
+            return None
+        m = re.search(r"(estimated|expected)\*?\s+to report earnings on\s+(\d{2}/\d{2}/\d{4})"
+                      r"(?:\s+(after market close|before market open|during market hours))?", text)
+        if not m:
+            return {}
+        try:
+            d = datetime.strptime(m.group(2), "%m/%d/%Y").date()
+        except ValueError:
+            return {}
+        timing = _NASDAQ_TIMING.get(m.group(3) or "")
+        # "estimated" = derived from historical report dates; "expected" with a session
+        # (after/before market) is only shown once the company has announced.
+        if m.group(1) == "estimated":
+            status = "estimated"
+        else:
+            status = "confirmed" if timing else "unknown"
+        eps = re.search(r"consensus EPS forecast for the quarter is \$(-?\d+(?:\.\d+)?)", text)
+        n = re.search(r"based on\s+(\d+)\s+analysts", text)
+        return {"date": d.isoformat(), "status": status, "timing": timing,
+                "eps_estimate": float(eps.group(1)) if eps else None,
+                "num_analysts": int(n.group(1)) if n else None}
+    return _memo(("nasdaq_earn", yf_symbol), TTL_SLOW, fetch)
+
+
+_STATUS_BASIS = {
+    "confirmed": "Nasdaq/Zacks 標示為 expected 且有盤前/盤後時段,代表公司已公布",
+    "estimated": "依歷史公布日推估,公司尚未公布確切日期",
+    "unknown":   "來源未區分預計或確定",
+}
+
+
+def _earnings_info(yf_symbol: str) -> dict:
+    """Next earnings date merged from Nasdaq → Yahoo → Finviz, each tagged with whether
+    it is estimated or confirmed where the source says so. Returns {"status":
+    "unavailable", ...} when no source has a future date."""
+    cal = _fetch_earnings_cal(yf_symbol)
+    ydates = _earnings_dates_from_cal(cal) if cal is not None else []
+    nas = _nasdaq_earnings(yf_symbol) or {}
+    fv = None if (ydates or nas) else _finviz_earnings(yf_symbol)
+
+    sources = []
+    if nas:
+        sources.append({"source": "Nasdaq(Zacks)", "earnings_date": [nas["date"]],
+                        "date_status": nas["status"], "timing": nas["timing"]})
+    if ydates:
+        # a two-date list is Yahoo's estimated range
+        sources.append({"source": "Yahoo", "earnings_date": ydates,
+                        "date_status": "estimated" if len(ydates) > 1 else "unknown"})
+    if fv and "earnings_date" in fv:
+        sources.append({"source": "Finviz", "earnings_date": fv["earnings_date"],
+                        "date_status": "unknown", "timing": fv.get("timing")})
+    if not sources:
+        out = {"status": "unavailable",
+               "error": "資料源暫時抓不到下次財報日(Yahoo 失敗,備援也沒有),不代表沒有財報"}
+        if fv and fv.get("last_reported"):
+            out["last_reported"] = fv["last_reported"]
+        return out
+
+    primary = sources[0]
+    basis = _STATUS_BASIS[primary["date_status"]]
+    if primary["source"] == "Yahoo" and primary["date_status"] == "estimated":
+        basis = "Yahoo 給的是日期區間,尚未確定"
+    out = {
+        "earnings_date": primary["earnings_date"],
+        "date_status":   primary["date_status"],
+        "status_basis":  basis,
+        "timing":        primary.get("timing"),
+        "source":        primary["source"],
+        "sources":       sources,
+    }
+    firsts = sorted(date.fromisoformat(s["earnings_date"][0][:10]) for s in sources)
+    if len(sources) > 1 and firsts[0] != firsts[-1]:
+        if (firsts[-1] - firsts[0]).days == 1:
+            out["date_note"] = "來源日期差一天:盤後公布時 Yahoo 常記為隔日(股價反應日),以 timing 與 sources 為準"
+        else:
+            out["date_note"] = "各來源日期不一致(多為推估值),以 date_status 與 sources 為準"
+    return out
 
 
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
@@ -691,6 +880,9 @@ def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
         warn = _stale_warning(last_bar)
         if warn:
             result["stale_warning"] = warn
+        if _bar_in_progress(yf_symbol, last_bar):
+            result["last_bar_incomplete"] = True
+            result["last_bar_note"] = "最後一根 K 棒是今日盤中值(尚未收盤),last_close、成交量與各指標都以此計算"
 
         if market == "US" and not yf_symbol.startswith("^"):
             result["chart_url"] = f"https://finviz.com/chart.ashx?t={yf_symbol}&ty=c&ta=1&p=d"
@@ -784,7 +976,7 @@ def get_dividend_info(symbol: str) -> dict:
         def _fetch_divs():
             d = yf.Ticker(yf_symbol).dividends
             return d if not d.empty else None
-        dividends = _memo(("divs", yf_symbol), TTL_SLOW, _fetch_divs)
+        dividends = _yf_memo(("divs", yf_symbol), TTL_SLOW, _fetch_divs)
 
         last_divs = []
         if dividends is not None:
@@ -853,7 +1045,7 @@ def get_stock_news(symbol: str, limit: int = 8) -> dict:
 
     # Fallback: yfinance
     try:
-        news_raw = _memo(("yfnews", yf_symbol), TTL_NEWS, lambda: yf.Ticker(yf_symbol).news or None) or []
+        news_raw = _yf_memo(("yfnews", yf_symbol), TTL_NEWS, lambda: yf.Ticker(yf_symbol).news or None) or []
         items = []
         for n in news_raw[:limit]:
             # yfinance >=0.2.37 wraps content under a "content" key
@@ -904,10 +1096,12 @@ def get_analyst_ratings(symbol: str) -> dict:
         def _fetch_rec():
             try:
                 r = yf.Ticker(yf_symbol).recommendations
+            except YFRateLimitError:
+                raise
             except Exception:
                 return None
             return r if r is not None and not r.empty else None
-        rec = _memo(("rec", yf_symbol), TTL_SLOW, _fetch_rec)
+        rec = _yf_memo(("rec", yf_symbol), TTL_SLOW, _fetch_rec)
         if rec is not None:
             latest = rec.iloc[-1]
             result["ratings_breakdown"] = {
@@ -976,9 +1170,14 @@ def get_market_overview() -> dict:
                 "price":      data["price"],
                 "change_pct": data.get("change_pct"),
                 "change_basis": data.get("change_basis"),
+                "prev_close": data.get("prev_close"),
+                "price_type": data.get("price_type"),
                 "currency":   data.get("currency", "USD"),
                 "price_time": data.get("price_time"),
             }
+            for extra in ("price_note", "stale_warning"):
+                if data.get(extra):
+                    result[name][extra] = data[extra]
         else:
             result[name] = {"symbol": sym, "error": "無法取得"}
     return result
@@ -992,33 +1191,26 @@ def get_earnings_calendar(symbol: str) -> dict:
 
     回傳：
     - earnings_date：財報發布日（可能含區間）
-    - eps_estimate：EPS 預估值
-    - revenue_estimate：營收預估值
-    - last_earnings_date / last_eps_actual：上一季財報日與實際 EPS
+    - date_status：estimated（預計，依歷史推估或為區間）/ confirmed（確定，公司已公布）/
+      unknown（來源未區分）；status_basis 說明判斷依據
+    - timing：AMC=盤後、BMO=盤前
+    - source / sources：採用的來源與各來源各自的日期與狀態（Nasdaq(Zacks)→Yahoo→Finviz）
+    - eps_estimate / num_analysts：EPS 共識預估與分析師數；revenue_estimate：營收預估
+    - 抓不到時 status="unavailable"（資料源失敗，不代表沒有財報）
     """
     yf_symbol, _, _ = _resolve(symbol)
     try:
+        out = {"symbol": yf_symbol, **_earnings_info(yf_symbol)}
         cal = _fetch_earnings_cal(yf_symbol)
-
-        if cal is None or (hasattr(cal, "empty") and cal.empty):
-            fv = _finviz_earnings(yf_symbol)
-            if fv:
-                return {"symbol": yf_symbol, **fv,
-                        "note": "Yahoo 無資料,改用 Finviz;timing: AMC=盤後、BMO=盤前,不含 EPS/營收預估"}
-            return {"symbol": yf_symbol, "error": "無財報行事曆資料"}
-
-        # yfinance returns a dict
+        nas = _nasdaq_earnings(yf_symbol) or {}
         if isinstance(cal, dict):
-            return {
-                "symbol":           yf_symbol,
-                "earnings_date":    _earnings_dates_from_cal(cal),
-                "eps_estimate":     _safe_float(cal.get("EPS Estimate")),
-                "revenue_estimate": cal.get("Revenue Estimate"),
-            }
-
-        # fallback: DataFrame
-        return {"symbol": yf_symbol, "calendar_raw": str(cal)}
-
+            out["eps_estimate"] = _safe_float(cal.get("Earnings Average")) or nas.get("eps_estimate")
+            out["revenue_estimate"] = cal.get("Revenue Average")
+        elif nas.get("eps_estimate") is not None:
+            out["eps_estimate"] = nas["eps_estimate"]
+        if nas.get("num_analysts"):
+            out["num_analysts"] = nas["num_analysts"]
+        return out
     except Exception as e:
         return {"error": str(e)}
 
@@ -1038,8 +1230,10 @@ def get_market_calendar(symbols: list[str] | None = None, days: int = 45) -> dic
     - as_of：本次回應產生時間（UTC）
     - macro_events：範圍內的 FOMC 會議（start / end / note；利率決策在會議
       第二天美東時間 14:00 公布）
-    - earnings：每檔股票的下次財報日（yfinance 提供，可能為日期區間；
-      美股較準，台韓股可能缺資料）
+    - earnings：每檔股票的下次財報日，含 date_status（estimated 預計 / confirmed 確定 /
+      unknown）、timing、來源，以及 in_window（是否在 days 範圍內）；
+      美股較準（Nasdaq/Yahoo/Finviz），台韓股只有 Yahoo 可能缺資料；
+      status="unavailable" 代表資料源失敗，不是「不在範圍內」
     """
     today = date.today()
     horizon = today + timedelta(days=max(int(days), 1))
@@ -1057,15 +1251,18 @@ def get_market_calendar(symbols: list[str] | None = None, days: int = 45) -> dic
     earnings: dict[str, dict] = {}
     for raw in (symbols or []):
         yf_symbol, _, _ = _resolve(raw)
-        cal = _fetch_earnings_cal(yf_symbol)
-        dates = _earnings_dates_from_cal(cal) if cal is not None else []
-        fv = None if dates else _finviz_earnings(yf_symbol)
-        if dates:
-            earnings[yf_symbol] = {"input": raw, "earnings_date": dates}
-        elif fv:
-            earnings[yf_symbol] = {"input": raw, **fv}
-        else:
-            earnings[yf_symbol] = {"input": raw, "error": "無財報日資料"}
+        entry = {"input": raw, **_earnings_info(yf_symbol)}
+        if "error" in entry:
+            entry["error"] = "資料源暫時抓不到財報日(非『不在範圍內』,無法判斷)"
+        if "earnings_date" in entry:
+            try:
+                first = min(date.fromisoformat(d[:10]) for d in entry["earnings_date"])
+                entry["in_window"] = first <= horizon
+                if first > horizon:
+                    entry["note"] = f"下次財報日在查詢範圍({days} 天)之外"
+            except ValueError:
+                pass
+        earnings[yf_symbol] = entry
 
     return {
         "as_of":        _now_utc_str(),
@@ -1139,8 +1336,8 @@ def get_institutional_holders(symbol: str) -> dict:
             m = yf.Ticker(yf_symbol).major_holders
             return m if m is not None and not m.empty else None
 
-        inst = _memo(("inst", yf_symbol), TTL_SLOW, _fetch_inst)
-        major = _memo(("major", yf_symbol), TTL_SLOW, _fetch_major)
+        inst = _yf_memo(("inst", yf_symbol), TTL_SLOW, _fetch_inst)
+        major = _yf_memo(("major", yf_symbol), TTL_SLOW, _fetch_major)
 
         top = []
         if inst is not None and not inst.empty:
